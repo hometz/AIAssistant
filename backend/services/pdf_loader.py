@@ -7,7 +7,8 @@ def process_pdf(file_path: str):
 
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size = 1000,
-        chunk_overlap = 200
+        chunk_overlap = 200,
+        separators = ["\n\n", "\n", ".", " ", ""]
     )
 
     chunks = text_splitter.split_documents(documents)
