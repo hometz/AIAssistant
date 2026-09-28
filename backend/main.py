@@ -29,14 +29,11 @@ def register_user(username: str):
         user_id = database.create_user(username)
         return {"user_id": user_id, "username": username}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Ошибка при создании пользователя: {str(e)}")
+        raise HTTPException(status_code = 400, detail = f"Ошибка при создании пользователя: {str(e)}")
 
 
 @app.post("/documents/upload")
 def upload_document(file: UploadFile = File(...), x_user_id: str = Header(...)):
-    if not x_user_id:
-        raise HTTPException(status_code = 401, detail = "Заголовок x-user-id обязателен")
-
     document_id = str(uuid.uuid4())
     temp_file_path = f"temp_{file.filename}"
 
@@ -44,38 +41,29 @@ def upload_document(file: UploadFile = File(...), x_user_id: str = Header(...)):
         shutil.copyfileobj(file.file, buffer)
 
     try:
-
-        chunks = pdf_loader.process_pdf(temp_file_path)
+        docs = pdf_loader.process_pdf(temp_file_path)
         os.remove(temp_file_path)
 
-        rag_logic.save_chunks_to_vector_db(chunks, document_id)
+        rag_logic.process_and_save_document(docs = docs, document_id = document_id)
 
         database.save_document(document_id = document_id, user_id = x_user_id, filename = file.filename)
 
-        return {
-            "document_id": document_id,
-            "filename": file.filename,
-            "chunks_count": len(chunks),
-            "message": "Файл успешно обработан"
-        }
+        return {"document_id": document_id, "filename": file.filename, "message": "Успешно"}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=str(e))
+        if os.path.exists(temp_file_path): os.remove(temp_file_path)
+        raise HTTPException(status_code = 500, detail = str(e))
 
 
 @app.get("/documents")
 def list_documents(x_user_id: str = Header(...)):
     if not x_user_id:
-        raise HTTPException(status_code=401, detail="Заголовок x-user-id обязателен")
+        raise HTTPException(status_code = 401, detail="Заголовок x-user-id обязателен")
 
     try:
         document = database.get_user_documents(x_user_id)
         return {"documents": document}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code = 500, detail = str(e))
 
 
 @app.post("/chat/ask")

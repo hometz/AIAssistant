@@ -1,9 +1,10 @@
 import os
+import json
+import uuid
 from dotenv import load_dotenv
+from langchain_classic.retrievers import ParentDocumentRetriever
 from langchain_community.embeddings.dashscope import BATCH_SIZE
-
-load_dotenv()
-
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from database import get_chat_history
 from langchain_google_genai import ChatGoogleGenerativeAI
 from chromadb.utils import embedding_functions
@@ -11,104 +12,130 @@ from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_classic.storage import LocalFileStore, EncoderBackedStore
+from langchain_classic.memory import ConversationBufferMemory
+from langchain_classic.chains import ConversationalRetrievalChain
+from langchain_core.documents import Document
+
+load_dotenv()
 
 embeddings = OllamaEmbeddings(model = "nomic-embed-text-v2-moe:latest")
-
+PARENT_DOCS_PATH = "parent_docs_db"
 #llm = ChatOllama(model = "gemma4:latest", temperature = 0.2)
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", temperature=0.2)
 CHROMA_PATH = "./chroma_db"
 
+def _doc_to_bytes(doc: Document) -> bytes:
+    return json.dumps({
+        "page_content": doc.page_content,
+        "metadata": doc.metadata
+    }).encode("utf-8")
 
-def save_chunks_to_vector_db(chunks, document_id: str):
-    for chunk in chunks:
-        chunk.metadata["document_id"] = document_id
-
-
-    vector_store = Chroma(
-        persist_directory = CHROMA_PATH,
-        embedding_function = embeddings
+def _bytes_to_doc(b: bytes) -> Document:
+    data = json.loads(b.decode("utf-8"))
+    return Document(
+        page_content = data["page_content"],
+        metadata = data["metadata"]
     )
 
-    batch_size = 100
-    total_chunks = len(chunks)
+def get_pdr_retriever(document_id: str = None):
+    vector_store = Chroma(persist_directory = CHROMA_PATH, embedding_function = embeddings)
 
-    print(f"Начинаем векторизацию {total_chunks} чанков пакетами по {batch_size}...")
+    file_store = LocalFileStore(PARENT_DOCS_PATH)
+    doc_store = EncoderBackedStore(
+        store = file_store,
+        key_encoder = lambda k: k,
+        value_serializer = _doc_to_bytes,
+        value_deserializer = _bytes_to_doc
+    )
 
-    for i in range(0, total_chunks, batch_size):
-        batch = chunks[i : i + batch_size]
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size = 2000, chunk_overlap = 200)
+    child_splitter  = RecursiveCharacterTextSplitter(chunk_size = 400, chunk_overlap = 50)
 
-        texts = [chunk.page_content for chunk in batch]
+    search_kwargs = {"k": 4}
+
+    if document_id:
+        search_kwargs["filter"] = {"document_id": document_id}
+
+    return ParentDocumentRetriever(
+        vectorstore = vector_store,
+        docstore = doc_store,
+        parent_splitter = parent_splitter,
+        child_splitter = child_splitter,
+        search_kwargs = search_kwargs
+    )
+
+
+
+def save_chunks_to_vector_db(chunks:list[Document], vector_store: Chroma):
+    BATCH_SIZE = 100
+
+    for i in range(0, len(chunks), BATCH_SIZE):
+        batch = chunks[i : i + BATCH_SIZE]
+        texts = [doc.page_content for doc in batch]
         metadatas = [chunk.metadata for chunk in batch]
-
         vector_store.add_texts(texts = texts, metadatas = metadatas)
 
-        print(f"Обработано {min(i + batch_size, total_chunks)} / {total_chunks}")
 
-    print("Векторизация документа успешно завершена!")
+def process_and_save_document(docs: list[Document], document_id: str):
+    for doc in docs:
+        doc.metadata["document_id"] = document_id
+
+    retriever = get_pdr_retriever()
+
+    parent_docs = retriever.parent_splitter.split_documents(docs)
+    doc_ids = [str(uuid.uuid4()) for _ in parent_docs]
+
+    retriever.docstore.mset(list(zip(doc_ids, parent_docs)))
+
+    child_docs = []
+    for i, parent_doc in enumerate(parent_docs):
+        _children = retriever.child_splitter.split_documents([parent_doc])
+        for child in _children:
+            child.metadata[retriever.id_key] = doc_ids[i]
+            child_docs.append(child)
+
+    save_chunks_to_vector_db(child_docs, retriever.vectorstore)
 
     return True
 
 
+
 def ask_rag(question:str, document_id:str) -> str:
     raw_history = get_chat_history(document_id, limit = 10)
+    memory = ConversationBufferMemory(memory_key = "chat_history", return_messages = True)
 
-    history_text = ""
-    if raw_history:
-        for msg in raw_history:
-            sender = ""
-            if msg['role'] == 'user':
-                sender = "Пользователь"
-            else:
-                sender = "Ассистент"
+    for msg in raw_history:
+        if msg["role"] == "user":
+            memory.chat_memory.add_user_message(msg["content"])
+        else:
+            memory.chat_memory.add_ai_message(msg["content"])
 
-            history_text += f"{sender}: {msg['content']}\n"
+    retriever = get_pdr_retriever(document_id = document_id)
 
-    else:
-        history_text = "Это первое сообщение, истории пока нет."
 
-    vector_store = Chroma(
-        persist_directory = CHROMA_PATH,
-        embedding_function = embeddings
-    )
+    prompt_template = """Используй предоставленный контекст для ответа на вопрос. 
+    Если ответа нет в контексте, прямо скажи, что не знаешь ответа, не пытайся его выдумать.
+    Отвечай подробно и структурированно.
 
-    results = vector_store.similarity_search(
-        query = question,
-        k = 3,
-        filter = {"document_id" : document_id}
-    )
-
-    if not results:
-        return "По данному контексту ничего не найдено. Проверте загруженн ли файл"
-
-    context = "\n\n".join([doc.page_content for doc in results])
-
-    template = """
-    Ты умный ассистент, который помогает анализировать документ.
-    Отвечай на вопрос пользователя, основываясь ТОЛЬКО на контексте документа.
-    Если ответа нет в контексте, так и скажи. Учитывай историю диалога.
-
-    История нашего диалога:
-    {history}
-
-    Контекст из документа:
+    Контекст:
     {context}
 
-    Новый вопрос пользователя: {question}
-    Ответ:
-    """
+    Вопрос пользователя: {question}
 
-    prompt = PromptTemplate.from_template(template)
+    Ответ:"""
 
-    chain = prompt | llm | StrOutputParser()
+    qa_prompt = PromptTemplate(
+        template = prompt_template,
+        input_variables = ["context", "question"]
+    )
 
-    print("\n" + "=" * 30)
-    print("ИСТОРИЯ, КОТОРУЮ ВИДИТ ИИ:\n", history_text)
-    print("=" * 30 + "\n")
+    qa_chain = ConversationalRetrievalChain.from_llm(
+        llm = llm,
+        retriever = retriever,
+        memory = memory,
+        combine_docs_chain_kwargs = {"prompt": qa_prompt}
+    )
 
-    response = chain.invoke({
-        "context": context,
-        "question": question,
-        "history": history_text
-    })
-
-    return response
+    result = qa_chain.invoke({"question": question})
+    return result["answer"]
