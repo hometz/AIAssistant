@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import logging
 from dotenv import load_dotenv
 from langchain_classic.retrievers import ParentDocumentRetriever
 from langchain_community.embeddings.dashscope import BATCH_SIZE
@@ -15,9 +16,13 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_classic.storage import LocalFileStore, EncoderBackedStore
 from langchain_classic.memory import ConversationBufferMemory
 from langchain_classic.chains import ConversationalRetrievalChain
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langchain_core.documents import Document
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("langchain.retrievers.multi_query").setLevel(logging.DEBUG)
 
 embeddings = OllamaEmbeddings(model = "nomic-embed-text-v2-moe:latest")
 PARENT_DOCS_PATH = "parent_docs_db"
@@ -111,7 +116,24 @@ def ask_rag(question:str, document_id:str) -> str:
         else:
             memory.chat_memory.add_ai_message(msg["content"])
 
-    retriever = get_pdr_retriever(document_id = document_id)
+    base_retriever = get_pdr_retriever(document_id = document_id)
+
+    mqr_template = """Ты — ИИ-помощник исследователя. Твоя задача — сгенерировать 3 различных варианта заданного вопроса, чтобы улучшить поиск документов в векторной базе данных. 
+    Переформулируй вопрос, используя синонимы, альтернативные термины или смещая акцент, но сохраняй изначальный смысл.
+    Выведи ТОЛЬКО сами вопросы, каждый с новой строки, без нумерации, без дефисов в начале и без вводных слов. Никакого дополнительного текста.
+
+    Оригинальный вопрос: {question}"""
+
+    mqr_prompt = PromptTemplate(
+        input_variables = ["question"],
+        template = mqr_template
+    )
+
+    advanced_retriever = MultiQueryRetriever.from_llm(
+        retriever = base_retriever,
+        llm = llm,
+        prompt = mqr_prompt
+    )
 
 
     prompt_template = """Используй предоставленный контекст для ответа на вопрос. 
@@ -132,7 +154,7 @@ def ask_rag(question:str, document_id:str) -> str:
 
     qa_chain = ConversationalRetrievalChain.from_llm(
         llm = llm,
-        retriever = retriever,
+        retriever = advanced_retriever,
         memory = memory,
         combine_docs_chain_kwargs = {"prompt": qa_prompt}
     )

@@ -3,6 +3,7 @@
 !.env.example
 *.pem
 /backend/chroma_db/
+/backend/parent_docs_db/
 *.sqlite3
 temp_*.pdf
 /postgres_data/
