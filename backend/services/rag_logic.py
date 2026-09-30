@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import logging
+import time
 from dotenv import load_dotenv
 from langchain_classic.retrievers import ParentDocumentRetriever
 from langchain_community.embeddings.dashscope import BATCH_SIZE
@@ -82,25 +83,40 @@ def save_chunks_to_vector_db(chunks:list[Document], vector_store: Chroma):
         vector_store.add_texts(texts = texts, metadatas = metadatas)
 
 
+import uuid
+from langchain_core.documents import Document
+
+
 def process_and_save_document(docs: list[Document], document_id: str):
     for doc in docs:
         doc.metadata["document_id"] = document_id
 
-    retriever = get_pdr_retriever()
+    retriever = get_pdr_retriever(document_id=document_id)
 
-    parent_docs = retriever.parent_splitter.split_documents(docs)
-    doc_ids = [str(uuid.uuid4()) for _ in parent_docs]
+    BATCH_SIZE = 30
 
-    retriever.docstore.mset(list(zip(doc_ids, parent_docs)))
+    for i in range(0, len(docs), BATCH_SIZE):
+        batch_docs = docs[i: i + BATCH_SIZE]
 
-    child_docs = []
-    for i, parent_doc in enumerate(parent_docs):
-        _children = retriever.child_splitter.split_documents([parent_doc])
-        for child in _children:
-            child.metadata[retriever.id_key] = doc_ids[i]
-            child_docs.append(child)
+        parent_docs = retriever.parent_splitter.split_documents(batch_docs)
+        doc_ids = [str(uuid.uuid4()) for _ in parent_docs]
 
-    save_chunks_to_vector_db(child_docs, retriever.vectorstore)
+        retriever.docstore.mset(list(zip(doc_ids, parent_docs)))
+
+        child_docs = []
+        for j, parent_doc in enumerate(parent_docs):
+            _children = retriever.child_splitter.split_documents([parent_doc])
+            for child in _children:
+                if child.page_content and child.page_content.strip():
+                    child.metadata[retriever.id_key] = doc_ids[j]
+                    child_docs.append(child)
+
+        if child_docs:
+            save_chunks_to_vector_db(child_docs, retriever.vectorstore)
+
+        print(f"Обработано {min(i + BATCH_SIZE, len(docs))} из {len(docs)} страниц...")
+
+        time.sleep(0.1)
 
     return True
 
