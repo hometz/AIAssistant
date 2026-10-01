@@ -83,9 +83,6 @@ def save_chunks_to_vector_db(chunks:list[Document], vector_store: Chroma):
         vector_store.add_texts(texts = texts, metadatas = metadatas)
 
 
-import uuid
-from langchain_core.documents import Document
-
 
 def process_and_save_document(docs: list[Document], document_id: str):
     for doc in docs:
