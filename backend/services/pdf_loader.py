@@ -8,13 +8,10 @@ from langchain_core.documents import Document
 
 if torch.cuda.is_available():
     accel_device = "cuda"
-    print("CUDA!!!!!!!!!!!!!!!!!!!!!!!!!")
 elif torch.backends.mps.is_available():
     accel_device = "mps"
-    print("MPS!!!!!!!!!!!!!!!!!!!!!!!!!!")
 else:
     accel_device = "cpu"
-    print("CPU!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
 print(f"--- Docling инициализирован на устройстве: {accel_device.upper()} ---")
 
