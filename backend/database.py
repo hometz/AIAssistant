@@ -133,6 +133,24 @@ def get_user_documents(user_id: str) -> list:
     conn.close()
     return documents
 
+def delete_document(document_id: str, user_id: str) -> bool:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM documents WHERE id = %s AND user_id = %s RETURNING id",
+            (document_id, user_id)
+        )
+        deleted_row = cur.fetchone()
+        conn.commit()
+        return bool(deleted_row)
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+
 def save_message(document_id: str, role: str, content: str):
     conn = get_db_connection()
     cur = conn.cursor()

@@ -8,13 +8,27 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 import pdfplumber
 
 
-def process_pdf(file_path: str) -> list[Document]:
+def process_pdf(file_path: str, document_id: str) -> list[Document]:
     full_text = ""
     with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
+        total_pages = len(pdf.pages)
+        if document_id:
+            from services.rag_logic import progress_store
+            progress_store[document_id] = {
+                "status": "extracting",
+                "current": 0,
+                "total": total_pages
+            }
+
+        for i, page in enumerate(pdf.pages):
             text = page.extract_text()
             if text:
                 full_text += text + "\n\n"
+
+            if document_id:
+                from services.rag_logic import progress_store
+                progress_store[document_id]["current"] = i + 1
+
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=4000,
@@ -31,6 +45,8 @@ def process_pdf(file_path: str) -> list[Document]:
         ))
 
     return docs
+
+
 
 # Старая обработка файла через Docling
 # if torch.cuda.is_available():

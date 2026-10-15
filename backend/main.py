@@ -6,7 +6,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uuid
@@ -65,6 +65,24 @@ def send_verification_email(to_email: str, code: str):
             print("Ошибка отправки email:", e)
 
 
+def background_process_file(temp_file_path: str, document_id: str, user_id: str, filename: str):
+    from services.rag_logic import progress_store
+
+    try:
+        docs = pdf_loader.process_pdf(temp_file_path, document_id)
+
+        rag_logic.process_and_save_document(docs=docs, document_id=document_id)
+
+        database.save_document(document_id=document_id, user_id=user_id, filename=filename)
+
+    except Exception as e:
+        print("Ошибка фоновой обработки:", e)
+        progress_store[document_id] = {"status": "error", "current": 0, "total": 0, "error": str(e)}
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
 @app.post("/users/register")
 def register_user(request: RegisterRequest):
     code = str(random.randint(100000, 999999))
@@ -96,29 +114,54 @@ def login_user(request: LoginRequest):
     return {"access_token": token, "username": request.username}
 
 @app.post("/documents/upload")
-def upload_document(file: UploadFile = File(...), user_id: str = Depends(get_current_user)):
+def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...), user_id: str = Depends(get_current_user)):
     document_id = str(uuid.uuid4())
-    temp_file_path = f"temp_{file.filename}"
+    temp_file_path = f"temp_{document_id}_{file.filename}"
 
     with open(temp_file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    try:
-        docs = pdf_loader.process_pdf(temp_file_path)
-        os.remove(temp_file_path)
+    from services.rag_logic import progress_store
+    progress_store[document_id] = {"status": "processing", "current": 0, "total": 1}
 
-        rag_logic.process_and_save_document(docs=docs, document_id=document_id)
-        database.save_document(document_id=document_id, user_id=user_id, filename=file.filename)
+    background_tasks.add_task(background_process_file, temp_file_path, document_id, user_id, file.filename)
 
-        return {"document_id": document_id, "filename": file.filename, "message": "Успешно"}
-    except Exception as e:
-        if os.path.exists(temp_file_path): os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"document_id": document_id, "filename": file.filename, "message": "Файл принят в обработку"}
+
+
+@app.get("/documents/progress/{document_id}")
+def get_document_progress(document_id: str, user_id: str = Depends(get_current_user)):
+    from services.rag_logic import progress_store
+    progress = progress_store.get(document_id, {"status": "starting", "current": 0, "total": 1})
+    return progress
+
 
 @app.get("/documents")
 def list_documents(user_id: str = Depends(get_current_user)):
     try:
         return {"documents": database.get_user_documents(user_id)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/documents/{document_id}")
+def delete_document_endpoint(document_id: str, user_id: str = Depends(get_current_user)):
+    try:
+        success = database.delete_document(document_id, user_id)
+
+        if not success:
+            raise HTTPException(status_code=404, detail="Документ не найден или нет прав на удаление")
+
+        try:
+            retriever = rag_logic.get_pdr_retriever(document_id=document_id)
+            if retriever and retriever.vectorstore:
+                retriever.vectorstore.delete_collection()
+        except Exception as chroma_error:
+            print(f"Ошибка при очистке ChromaDB: {chroma_error}")
+
+        return {"message": "Документ, история и векторы успешно удалены"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

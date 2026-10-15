@@ -84,13 +84,25 @@ def save_chunks_to_vector_db(chunks:list[Document], vector_store: Chroma):
 
 
 
+progress_store = {}
+
 def process_and_save_document(docs: list[Document], document_id: str):
+
+    progress_store[document_id] = {"status": "processing", "current": 0, "total": len(docs)}
+
     for doc in docs:
         doc.metadata["document_id"] = document_id
 
     retriever = get_pdr_retriever(document_id=document_id)
 
-    BATCH_SIZE = 30
+    total_pages = len(docs)
+
+    if total_pages <= 50:
+        BATCH_SIZE = 5
+    elif total_pages <= 200:
+        BATCH_SIZE = 10
+    else:
+        BATCH_SIZE = 30
 
     for i in range(0, len(docs), BATCH_SIZE):
         batch_docs = docs[i: i + BATCH_SIZE]
@@ -111,10 +123,11 @@ def process_and_save_document(docs: list[Document], document_id: str):
         if child_docs:
             save_chunks_to_vector_db(child_docs, retriever.vectorstore)
 
-        print(f"Обработано {min(i + BATCH_SIZE, len(docs))} из {len(docs)} страниц...")
+        progress_store[document_id]["current"] = min(i + BATCH_SIZE, len(docs))
 
         time.sleep(0.1)
 
+    progress_store[document_id]["status"] = "completed"
     return True
 
 
