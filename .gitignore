@@ -4,6 +4,7 @@
 *.pem
 /backend/chroma_db/
 /backend/parent_docs_db/
+/backend/uploads/
 *.sqlite3
 temp_*.pdf
 /postgres_data/

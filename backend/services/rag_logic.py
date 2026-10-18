@@ -3,6 +3,7 @@ import json
 import uuid
 import logging
 import time
+import re
 from dotenv import load_dotenv
 from langchain_classic.retrievers import ParentDocumentRetriever
 from langchain_community.embeddings.dashscope import BATCH_SIZE
@@ -19,6 +20,7 @@ from langchain_classic.memory import ConversationBufferMemory
 from langchain_classic.chains import ConversationalRetrievalChain
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 from langchain_core.documents import Document
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 load_dotenv()
 
@@ -30,6 +32,9 @@ PARENT_DOCS_PATH = "parent_docs_db"
 #llm = ChatOllama(model = "gemma4:latest", temperature = 0.2)
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", temperature=0.2)
 CHROMA_PATH = "./chroma_db"
+
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^\w]", "", w.lower().replace("ё", "е"))
 
 def _doc_to_bytes(doc: Document) -> bytes:
     return json.dumps({
@@ -74,13 +79,15 @@ def get_pdr_retriever(document_id: str = None):
 
 
 def save_chunks_to_vector_db(chunks:list[Document], vector_store: Chroma):
-    BATCH_SIZE = 100
+    BATCH_SIZE = 50
 
     for i in range(0, len(chunks), BATCH_SIZE):
         batch = chunks[i : i + BATCH_SIZE]
         texts = [doc.page_content for doc in batch]
         metadatas = [chunk.metadata for chunk in batch]
         vector_store.add_texts(texts = texts, metadatas = metadatas)
+
+        time.sleep(0.05)
 
 
 
@@ -102,7 +109,7 @@ def process_and_save_document(docs: list[Document], document_id: str):
     elif total_pages <= 200:
         BATCH_SIZE = 10
     else:
-        BATCH_SIZE = 30
+        BATCH_SIZE = 100
 
     for i in range(0, len(docs), BATCH_SIZE):
         batch_docs = docs[i: i + BATCH_SIZE]
@@ -125,65 +132,155 @@ def process_and_save_document(docs: list[Document], document_id: str):
 
         progress_store[document_id]["current"] = min(i + BATCH_SIZE, len(docs))
 
-        time.sleep(0.1)
+        #time.sleep(0.1)
 
     progress_store[document_id]["status"] = "completed"
     return True
 
 
 
-def ask_rag(question:str, document_id:str) -> str:
-    raw_history = get_chat_history(document_id, limit = 10)
-    memory = ConversationBufferMemory(memory_key = "chat_history", return_messages = True)
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            elif hasattr(item, "text"):
+                parts.append(str(item.text))
+        return "\n".join(parts)
+    return str(content)
 
-    for msg in raw_history:
-        if msg["role"] == "user":
-            memory.chat_memory.add_user_message(msg["content"])
-        else:
-            memory.chat_memory.add_ai_message(msg["content"])
 
-    base_retriever = get_pdr_retriever(document_id = document_id)
+def _stem(w: str) -> str:
+    clean = re.sub(r"[^\w]", "", w.lower().replace("ё", "е"))
+    if clean.isdigit():
+        return clean
+    if len(clean) < 4:
+        return ""
+    return clean[:5]
 
-    mqr_template = """Ты — ИИ-помощник исследователя. Твоя задача — сгенерировать 3 различных варианта заданного вопроса, чтобы улучшить поиск документов в векторной базе данных. 
-    Переформулируй вопрос, используя синонимы, альтернативные термины или смещая акцент, но сохраняй изначальный смысл.
-    Выведи ТОЛЬКО сами вопросы, каждый с новой строки, без нумерации, без дефисов в начале и без вводных слов. Никакого дополнительного текста.
+
+def ask_rag(question: str, document_id: str) -> tuple[str, list[dict]]:
+    raw_history = get_chat_history(document_id, limit=10)
+
+    retriever = get_pdr_retriever(document_id=document_id)
+    vectorstore = retriever.vectorstore
+    docstore = retriever.docstore
+    id_key = retriever.id_key
+
+    mqr_template = f"""Ты — ИИ-помощник исследователя. Твоя задача — сгенерировать 3 различных варианта заданного вопроса, чтобы улучшить поиск документов в векторной базе данных. 
+    Если в вопросе есть числительные словами (например, "третий", "второй"), обязательно напиши их цифрами ("3", "2") в вариантах вопроса.
+    Выведи ТОЛЬКО сами вопросы, каждый с новой строки, без нумерации и дефисов.
 
     Оригинальный вопрос: {question}"""
 
-    mqr_prompt = PromptTemplate(
-        input_variables = ["question"],
-        template = mqr_template
+    mq_raw = llm.invoke(mqr_template).content
+    mq_result = _extract_text(mq_raw)
+    queries = [q.strip() for q in mq_result.split("\n") if len(q.strip()) > 3]
+
+    if question not in queries:
+        queries.insert(0, question)
+
+    search_kwargs = {"k": 3}
+    if document_id:
+        search_kwargs["filter"] = {"document_id": document_id}
+
+    child_docs = []
+    seen_content = set()
+
+    for q in queries:
+        docs = vectorstore.similarity_search(q, **search_kwargs)
+        for d in docs:
+            if d.page_content not in seen_content:
+                child_docs.append(d)
+                seen_content.add(d.page_content)
+
+    if not child_docs:
+        return "Ответ не найден.", []
+
+    parent_ids = list(dict.fromkeys([doc.metadata[id_key] for doc in child_docs if id_key in doc.metadata]))
+    parent_docs = [doc for doc in docstore.mget(parent_ids) if doc]
+    context = "\n\n---\n\n".join([doc.page_content for doc in parent_docs])
+
+    messages = [
+        SystemMessage(content=f"""Используй предоставленный контекст для ответа на вопрос. 
+Если ответа нет в контексте, прямо скажи, что не знаешь ответа, не пытайся его выдумать.
+Отвечай подробно и структурированно.
+
+ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ДЛЯ ПОДСВЕТКИ В PDF:
+В самом конце своего ответа с новой строки напиши разделитель ===ЦИТАТА=== и сразу после него скопируй ДОСЛОВНО (слово в слово, без единого изменения) ТОЛЬКО тот абзац или блок из Контекста, где находится ответ на вопрос. Не копируй соседние слайды или лишние разделы.
+
+Контекст:
+{context}""")
+    ]
+
+    for msg in raw_history:
+        msg_text = _extract_text(msg["content"])
+        if msg["role"] == "user":
+            messages.append(HumanMessage(content=msg_text))
+        else:
+            messages.append(AIMessage(content=msg_text))
+
+    messages.append(HumanMessage(content=question))
+
+    response = llm.invoke(messages)
+    full_output = _extract_text(response.content).strip()
+
+    if "===ЦИТАТА===" in full_output:
+        parts = full_output.split("===ЦИТАТА===", 1)
+        answer = parts[0].strip()
+        exact_quote = parts[1].strip()
+    else:
+        answer = full_output
+        exact_quote = ""
+
+    if not answer or "не знаю" in answer.lower() or "нет информации" in answer.lower():
+        return answer if answer else "Ответ не найден.", []
+
+    sources = []
+
+    if exact_quote:
+        quote_stems = {_stem(w) for w in exact_quote.split() if _stem(w)}
+        best_page = 1
+        best_overlap = -1
+
+        for p_doc in parent_docs:
+            p_stems = {_stem(w) for w in p_doc.page_content.split() if _stem(w)}
+            overlap = len(quote_stems & p_stems)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                page_val = p_doc.metadata.get("page", 1)
+                best_page = int(page_val) if str(page_val).isdigit() else 1
+
+        sources.append({"page": best_page, "text": exact_quote})
+    else:
+        ans_stems = {_stem(w) for w in answer.split() if _stem(w)}
+        best_page = 1
+        matched_lines = []
+
+        for p_doc in parent_docs:
+            page_val = p_doc.metadata.get("page", 1)
+            p_num = int(page_val) if str(page_val).isdigit() else 1
+            for line in p_doc.page_content.split("\n"):
+                l_stems = {_stem(w) for w in line.split() if _stem(w)}
+                if len(l_stems & ans_stems) >= 2:
+                    matched_lines.append(line.strip())
+                    best_page = p_num
+
+        if matched_lines:
+            sources.append({"page": best_page, "text": "\n".join(matched_lines[:6])})
+
+    print("\n" + "=" * 50)
+    print(f"[RAG DEBUG] Ответ модели:\n{answer}")
+    print("-" * 50)
+    print(f"[RAG DEBUG] Извлеченная цитата для подсветки (стр. {sources[0]['page'] if sources else '?'}):\n{sources[0]['text'] if sources else 'НЕТ ЦИТАТЫ'}")
+    print("=" * 50 + "\n")
+
+    print(
+        f"[RAG DEBUG] Выделена цитата ({len(sources[0]['text']) if sources else 0} симв.) на стр. {[s['page'] for s in sources]}"
     )
-
-    advanced_retriever = MultiQueryRetriever.from_llm(
-        retriever = base_retriever,
-        llm = llm,
-        prompt = mqr_prompt
-    )
-
-
-    prompt_template = """Используй предоставленный контекст для ответа на вопрос. 
-    Если ответа нет в контексте, прямо скажи, что не знаешь ответа, не пытайся его выдумать.
-    Отвечай подробно и структурированно.
-
-    Контекст:
-    {context}
-
-    Вопрос пользователя: {question}
-
-    Ответ:"""
-
-    qa_prompt = PromptTemplate(
-        template = prompt_template,
-        input_variables = ["context", "question"]
-    )
-
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm = llm,
-        retriever = advanced_retriever,
-        memory = memory,
-        combine_docs_chain_kwargs = {"prompt": qa_prompt}
-    )
-
-    result = qa_chain.invoke({"question": question})
-    return result["answer"]
+    return answer, sources

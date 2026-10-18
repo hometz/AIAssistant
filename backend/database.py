@@ -5,15 +5,16 @@ import hashlib
 import uuid
 import os
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 
 DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME", "rag_db"),
-    "user": os.getenv("DB_USER", "dinal"),
-    "password": os.getenv("DB_PASSWORD", ""),
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432")
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST"),
+    "port": os.getenv("DB_PORT")
 }
 
 def get_db_connection():
@@ -51,6 +52,7 @@ def init_db():
         document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
         role VARCHAR(10) NOT NULL,
         content TEXT NOT NULL,
+        sources JSONB DEFAULT '[]',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """
@@ -151,20 +153,30 @@ def delete_document(document_id: str, user_id: str) -> bool:
         cur.close()
         conn.close()
 
-def save_message(document_id: str, role: str, content: str):
+def save_message(document_id: str, role: str, content: str, sources: list = None):
+    if sources is None:
+        sources = []
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("INSERT INTO chat_messages (document_id, role, content) VALUES (%s, %s, %s)", (document_id, role, content))
+    cur.execute(
+        "INSERT INTO chat_messages (document_id, role, content, sources) VALUES (%s, %s, %s, %s)",
+        (document_id, role, content, json.dumps(sources, ensure_ascii=False))
+    )
     conn.commit()
     cur.close()
     conn.close()
 
-def get_chat_history(document_id: str, limit: int = 10):
+def get_chat_history(document_id: str, limit: int = 20):
     conn = get_db_connection()
     cur = conn.cursor()
     query = """
-        SELECT role, content 
-        FROM (SELECT role, content, created_at FROM chat_messages WHERE document_id = %s ORDER BY created_at DESC LIMIT %s) as recent
+        SELECT role, content, COALESCE(sources, '[]'::jsonb) as sources
+        FROM (
+            SELECT role, content, sources, created_at 
+            FROM chat_messages 
+            WHERE document_id = %s 
+            ORDER BY created_at DESC LIMIT %s
+        ) as recent
         ORDER BY created_at ASC;
     """
     cur.execute(query, (document_id, limit))

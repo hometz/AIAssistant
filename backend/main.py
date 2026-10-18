@@ -1,8 +1,10 @@
 import shutil
 import os
+import base64
 import jwt
 import random
 import smtplib
+import re
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime, timedelta
@@ -13,8 +15,10 @@ import uuid
 import database
 from services import pdf_loader
 from services import rag_logic
-from schemas import AskRequest, RegisterRequest, LoginRequest, VerifyRequest
+from schemas import AskRequest, RegisterRequest, LoginRequest, VerifyRequest, PreviewRequest
 from dotenv import load_dotenv
+import fitz
+import pdfplumber
 
 load_dotenv()
 
@@ -22,10 +26,16 @@ SECRET_KEY = os.getenv("JWT_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 app = FastAPI()
 security = HTTPBearer()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"],
                    allow_headers=["*"])
+
+def _norm(w: str) -> str:
+    return re.sub(r"[^\w]", "", w.lower().replace("ё", "е"))
 
 
 def create_access_token(user_id: str, username: str):
@@ -78,7 +88,7 @@ def background_process_file(temp_file_path: str, document_id: str, user_id: str,
     except Exception as e:
         print("Ошибка фоновой обработки:", e)
         progress_store[document_id] = {"status": "error", "current": 0, "total": 0, "error": str(e)}
-    finally:
+
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
@@ -116,15 +126,15 @@ def login_user(request: LoginRequest):
 @app.post("/documents/upload")
 def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...), user_id: str = Depends(get_current_user)):
     document_id = str(uuid.uuid4())
-    temp_file_path = f"temp_{document_id}_{file.filename}"
+    file_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
 
-    with open(temp_file_path, "wb") as buffer:
+    with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     from services.rag_logic import progress_store
     progress_store[document_id] = {"status": "processing", "current": 0, "total": 1}
 
-    background_tasks.add_task(background_process_file, temp_file_path, document_id, user_id, file.filename)
+    background_tasks.add_task(background_process_file, file_path, document_id, user_id, file.filename)
 
     return {"document_id": document_id, "filename": file.filename, "message": "Файл принят в обработку"}
 
@@ -144,6 +154,91 @@ def list_documents(user_id: str = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/documents/preview")
+def preview_document_page(request: PreviewRequest, user_id: str = Depends(get_current_user)):
+    file_path = os.path.join(UPLOAD_DIR, f"{request.document_id}.pdf")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Файл PDF не найден на сервере (перезагрузите документ)")
+
+    target_page = request.page
+    highlight_text = (request.highlight_text or "").strip()
+
+    if not highlight_text:
+        history = database.get_chat_history(request.document_id, limit=5)
+        for msg in reversed(history):
+            if msg.get("role") == "ai" and msg.get("sources"):
+                srcs = msg["sources"]
+
+                if isinstance(srcs, str):
+                    import json
+                    try:
+                        srcs = json.loads(srcs)
+                    except:
+                        srcs = []
+
+                if isinstance(srcs, list):
+                    for s in srcs:
+                        if int(s.get("page", 0)) == target_page:
+                            highlight_text = s.get("text", "")
+                            break
+
+            if highlight_text:
+                break
+
+    try:
+        with fitz.open(file_path) as pdf:
+            total_pages = len(pdf)
+            page_idx = max(0, min(target_page - 1, total_pages - 1))
+            page = pdf[page_idx]
+
+            highlighted_count = 0
+
+            if highlight_text:
+                lines = [" ".join(line.split()) for line in highlight_text.split("\n") if len(line.strip()) > 3]
+
+                for line in lines:
+                    quads = page.search_for(line, quads=True)
+
+                    if not quads:
+                        clean_segments = [
+                            seg.strip()
+                            for seg in re.split(r'[—–«»"“”():;,.!?]+', line)
+                            if len(seg.strip()) >= 5
+                        ]
+                        for seg in clean_segments:
+                            seg_quads = page.search_for(seg, quads=True)
+                            if not seg_quads and len(seg.split()) >= 3:
+                                words = seg.split()
+                                for k in range(0, len(words) - 1, 2):
+                                    sub = " ".join(words[k: k + 3])
+                                    if len(sub) >= 8:
+                                        seg_quads.extend(page.search_for(sub, quads=True))
+                            quads.extend(seg_quads)
+
+                    for quad in quads:
+                        annot = page.add_highlight_annot(quad)
+                        annot.set_colors(stroke=(1.0, 0.92, 0.23))
+                        annot.set_opacity(0.45)
+                        annot.update()
+                        highlighted_count += 1
+
+            print(
+                f"[PREVIEW DEBUG] Стр. {page_idx + 1}/{total_pages} | Текст извлечен: {len(highlight_text)} симв. | Выделено блоков: {highlighted_count}")
+
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+            img_bytes = pix.tobytes("png")
+            img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+
+            return {
+                "image": f"data:image/png;base64,{img_base64}",
+                "page": page_idx + 1,
+                "total_pages": total_pages
+            }
+    except Exception as e:
+        print("Ошибка рендеринга:", e)
+        raise HTTPException(status_code=500, detail=f"Ошибка рендеринга страницы: {str(e)}")
+
+
 @app.delete("/documents/{document_id}")
 def delete_document_endpoint(document_id: str, user_id: str = Depends(get_current_user)):
     try:
@@ -151,6 +246,10 @@ def delete_document_endpoint(document_id: str, user_id: str = Depends(get_curren
 
         if not success:
             raise HTTPException(status_code=404, detail="Документ не найден или нет прав на удаление")
+
+        file_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
         try:
             retriever = rag_logic.get_pdr_retriever(document_id=document_id)
@@ -165,14 +264,19 @@ def delete_document_endpoint(document_id: str, user_id: str = Depends(get_curren
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/chat/ask")
 def ask_question(request: AskRequest, user_id: str = Depends(get_current_user)):
     try:
         database.save_message(document_id=request.document_id, role="user", content=request.question)
-        answer = rag_logic.ask_rag(question=request.question, document_id=request.document_id)
-        database.save_message(document_id=request.document_id, role="ai", content=answer)
-        return {"answer": answer}
+
+        answer, sources = rag_logic.ask_rag(question=request.question, document_id=request.document_id)
+
+        database.save_message(document_id=request.document_id, role="ai", content=answer, sources=sources)
+
+        return {"answer": answer, "sources": sources}
     except Exception as e:
+        print("Ошибка в /chat/ask:", e)
         return {"error": str(e)}
 
 @app.get("/chat/history/{document_id}")

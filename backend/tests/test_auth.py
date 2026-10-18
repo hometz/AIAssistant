@@ -58,3 +58,43 @@ def test_send_verification_email_logic():
         mock_server.send_message.assert_called_once()
 
         mock_server.quit.assert_called_once()
+
+
+def test_verify_user_success():
+    with patch("database.verify_user_code") as mock_verify:
+        mock_verify.return_value = {"id": "123", "username": "test_user"}
+
+        response = client.post("/users/verify", json={
+            "email": "test@example.com",
+            "code": "777888"
+        })
+
+        assert response.status_code == 200
+        assert "access_token" in response.json()
+        assert response.json()["username"] == "test_user"
+
+
+def test_login_user_success():
+    with patch("database.authenticate_user") as mock_auth:
+        mock_auth.return_value = ("123", "Успешный вход")
+
+        response = client.post("/users/login", json={
+            "username": "test_user",
+            "password": "Password123"
+        })
+
+        assert response.status_code == 200
+        assert "access_token" in response.json()
+
+
+def test_login_user_failure():
+    with patch("database.authenticate_user") as mock_auth:
+        mock_auth.return_value = (None, "Неверный пароль")
+
+        response = client.post("/users/login", json={
+            "username": "test_user",
+            "password": "WrongPassword"
+        })
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Неверный пароль"

@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
+from typing import Optional
 import re
 
 class AskRequest(BaseModel):
@@ -23,3 +24,8 @@ class RegisterRequest(BaseModel):
 class VerifyRequest(BaseModel):
     email: str
     code: str
+
+class PreviewRequest(BaseModel):
+    document_id: str
+    page: int
+    highlight_text: Optional[str] = ""
